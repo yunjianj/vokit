@@ -17,7 +17,7 @@ with tarfile.open(sys.argv[1], 'w:gz') as archive:
         for path in paths:
             if not path.is_file() or path.is_symlink() or '__pycache__' in path.parts:
                 continue
-            if entry.is_dir() and path.suffix not in ('.go', '.py', '.css', '.sh', '.desktop', '.svg', '.rules', '.conf', '.install') and path.name not in ('PKGBUILD', 'vivo-desktop', 'vivo-desktop-helper'):
+            if entry.is_dir() and path.suffix not in ('.go', '.py', '.css', '.sh', '.desktop', '.svg', '.png', '.md', '.json', '.rules', '.conf', '.install') and path.name not in ('PKGBUILD', 'vivo-desktop', 'vivo-desktop-helper'):
                 continue
             archive.add(path, arcname=f'vokit-{sys.argv[2]}/{path.relative_to(root)}', recursive=False)
 PY

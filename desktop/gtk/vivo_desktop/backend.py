@@ -1,4 +1,6 @@
 """Bounded child-process bridge. GTK callbacks always run in the main context."""
+from .i18n import gettext as _
+from .i18n import current_language
 import concurrent.futures
 import configparser
 import json
@@ -28,10 +30,10 @@ def deliver(callback, *args):
 
 
 class Settings:
-    KEYS = {"phone", "manual_phone", "receive_dir", "clipboard", "notifications", "wifi_direct", "region", "theme", "window_width", "window_height", "list_mode"}
+    KEYS = {"phone", "manual_phone", "receive_dir", "clipboard", "notifications", "wifi_direct", "region", "language", "theme", "window_width", "window_height", "list_mode"}
 
     def __init__(self, path=None):
-        self.path = Path(path) if path else Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home()/".config"))) / "vivo-office-kit/preferences.json"
+        self.path = Path(path) if path else Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home()/".config"))) / 'vivo-office-kit/preferences.json'
         self.values = {}
         try:
             info = self.path.lstat()
@@ -109,7 +111,7 @@ class Backend:
         runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/vivolinux-{os.getuid()}"))
         directory = runtime/"vivolinux" if os.environ.get("XDG_RUNTIME_DIR") else runtime
         self.native_socket, self.media_socket = str(directory/"native.sock"), str(directory/"media.sock")
-        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="vivo-action")
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix='vivo-action')
         self.slots = threading.BoundedSemaphore(16)
         self.handles = set()
         self.lock = threading.Lock()
@@ -121,7 +123,8 @@ class Backend:
         return bool(self.pair_process and self.pair_process.active)
 
     def _spawn(self, handle, arguments):
-        process = subprocess.Popen([self.cli_path, *arguments], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen([self.cli_path, *arguments], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env={**os.environ, "VOKIT_LANGUAGE": current_language()})
         handle.process = process
         if handle.cancelled.is_set() or self.closed: handle.terminate()
         with self.lock: self.handles.add(handle)
@@ -135,25 +138,25 @@ class Backend:
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
             while True:
-                if handle.cancelled.is_set(): raise RuntimeError("Action cancelled.")
-                if time.monotonic() > deadline: raise RuntimeError("Phone action timed out.")
+                if handle.cancelled.is_set(): raise RuntimeError(_('Action cancelled.'))
+                if time.monotonic() > deadline: raise RuntimeError(_('Phone action timed out.'))
                 ready = selector.select(0.2)
                 if not ready: continue
                 chunk = os.read(process.stdout.fileno(), 8192)
                 if not chunk: break
                 if event is None:
-                    if len(result)+len(chunk)>limit: raise RuntimeError("Response exceeded its safety limit.")
+                    if len(result)+len(chunk)>limit: raise RuntimeError(_('Response exceeded its safety limit.'))
                     result.extend(chunk)
                 else:
                     pending.extend(chunk)
                     while b"\n" in pending:
-                        line, _, rest = pending.partition(b"\n")
+                        line, separator, rest = pending.partition(b"\n")
                         pending = bytearray(rest)
-                        if len(line)>limit: raise RuntimeError("Event exceeded its safety limit.")
+                        if len(line)>limit: raise RuntimeError(_('Event exceeded its safety limit.'))
                         value = json.loads(line)
-                        if not isinstance(value,dict): raise RuntimeError("Invalid connection event.")
+                        if not isinstance(value,dict): raise RuntimeError(_('Invalid connection event.'))
                         deliver(event, value)
-                    if len(pending)>limit: raise RuntimeError("Event exceeded its safety limit.")
+                    if len(pending)>limit: raise RuntimeError(_('Event exceeded its safety limit.'))
         return bytes(result)
 
     def _finish(self, handle):
@@ -170,23 +173,23 @@ class Backend:
         handle = ProcessHandle()
         if self.closed or not self.slots.acquire(blocking=False):
             handle.finished.set()
-            deliver(done, None, "Action queue is busy. Try again.")
+            deliver(done, None, _('Action queue is busy. Try again.'))
             return handle
         def work():
             value, error = None, None
             try:
                 process = self._spawn(handle, list(args))
-                timeout = 4 if args and args[0]=="native-status" else 600 if args and args[0] in ("preview","download","upload") else 90
+                timeout = 4 if args and args[0]=='native-status' else 600 if args and args[0] in ("preview","download","upload") else 90
                 output = self._read(handle, timeout, JSON_LIMIT)
                 code = process.wait(timeout=2)
                 value = json.loads(output)
                 if not isinstance(value,dict): raise ValueError()
                 if code:
-                    error = "Approve file access on your phone." if value.get("error")=="file_permission_required" else "Phone action failed. Check connection and access."
+                    error = _('Approve file access on your phone.') if value.get("error")=="file_permission_required" else _('Phone action failed. Check connection and access.')
             except RuntimeError as exception:
                 error = str(exception)
             except (OSError, ValueError, subprocess.SubprocessError):
-                error = "Native session unavailable. Connect your phone or reconnect the session."
+                error = _('Native session unavailable. Connect your phone or reconnect the session.')
             finally:
                 self._finish(handle)
                 self.slots.release()
@@ -196,16 +199,16 @@ class Backend:
 
     def pair(self, phone, trust, receive_dir, clipboard, notifications, on_event, on_exit, wifi_direct=False, region="overseas"):
         if region not in ("overseas", "china"):
-            raise ValueError("Unknown pairing region")
+            raise ValueError(_('Unknown pairing region'))
         if self.owned: return self.pair_process
         handle = ProcessHandle()
         self.pair_process = handle
-        args = ["pair","--persistent","--receive-dir",str(receive_dir),"--state-dir",str(Path(os.environ.get("XDG_DATA_HOME",str(Path.home()/".local/share")))/"vivo-office-kit/pairing")]
+        args = ["pair","--persistent",'--receive-dir',str(receive_dir),'--state-dir',str(Path(os.environ.get("XDG_DATA_HOME",str(Path.home()/".local/share")))/'vivo-office-kit/pairing')]
         if phone: args.extend(["--phone", phone])
-        if trust: args.append("--trust-scanned-phone")
+        if trust: args.append('--trust-scanned-phone')
         if clipboard: args.append("--clipboard")
         if notifications: args.append("--notifications")
-        if wifi_direct: args.append("--wifi-direct")
+        if wifi_direct: args.append('--wifi-direct')
         args.extend(["--region", region])
         def work():
             code = 1
@@ -218,7 +221,7 @@ class Backend:
             finally:
                 self._finish(handle)
                 deliver(on_exit, code)
-        threading.Thread(target=work, daemon=True, name="vivo-pair").start()
+        threading.Thread(target=work, daemon=True, name='vivo-pair').start()
         return handle
 
     def disconnect(self):

@@ -106,6 +106,20 @@ class BackendTests(unittest.TestCase):
         finally:
             backend.close()
 
+    def test_child_process_inherits_the_selected_interface_language(self):
+        from unittest.mock import patch
+        from . import i18n
+        backend = Backend(self.cli('import os,json\nprint(json.dumps({"language":os.environ.get("VOKIT_LANGUAGE")}))\n'))
+        with patch.dict(os.environ, {"VOKIT_LANGUAGE": "system"}):
+            try:
+                i18n.configure("ja")
+                value, error = self.wait(lambda done: backend.call(["native-status"], done))
+                self.assertIsNone(error)
+                self.assertEqual(value["language"], "ja")
+            finally:
+                backend.close()
+                i18n.configure("en")
+
 
 class TransferBoundaryTests(unittest.TestCase):
     def test_batch_download_names_preserve_existing_files(self):
