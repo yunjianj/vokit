@@ -51,6 +51,19 @@ func TestDirectServiceProtocolAndQR(t *testing.T) {
 		t.Fatal("unauthenticated API accepted")
 	}
 	registerDirect(t, b, n)
+	release := b.authorizeAutomatic("bluetooth-window")
+	waiting := directRequest(b, "POST", "/api/p2p/heartbeat", `{"id":"fixture-group"}`, "Bearer "+b.token)
+	if !strings.Contains(waiting.Body.String(), `"reconnectRequested":false`) || !strings.Contains(waiting.Body.String(), `"pairingActive":true`) {
+		t.Fatal("Bluetooth window incorrectly requested persistent invitations")
+	}
+	rAuto := httptest.NewRequest("GET", "/notifyConnection", nil)
+	rAuto.RemoteAddr = "192.168.49.22:54321"
+	wAuto := httptest.NewRecorder()
+	b.handleCallback(wAuto, rAuto)
+	if wAuto.Code != 403 {
+		t.Fatal("automatic preconnection accepted an unsolicited QR callback")
+	}
+	release()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if got, err := b.waitNetwork(ctx); err != nil || got.ID != n.ID {

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .i18n import gettext as _, N_
 from .i18n import configure, LANGUAGES
+from .backend import Autostart
 
 import argparse
 import base64
@@ -11,6 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 import os
 from pathlib import Path
+import pwd
+import secrets
+import json
 import shutil
 import stat
 import sys
@@ -152,6 +156,10 @@ class OfficeWindow(Adw.ApplicationWindow):
         self.event_connected = False
         self.external_session = False
         self.owned = False
+        self.reconnecting = False
+        self.startup_resume_checked = False
+        self.account_logged_in = False
+        self.login_handle = None
         self.shutting_down = False
         self.category = "recent"
         self.directory = "/storage/emulated/0/Download"
@@ -169,6 +177,8 @@ class OfficeWindow(Adw.ApplicationWindow):
         self.media_panel = None
         self.mirror_window = None
         self.qr_dialog = None
+        self.pair_progress_dialog = None
+        self.pair_failure = False
         self.preview_busy = False
         self.transfer_busy = False
         self.pending_sends = deque()
@@ -551,11 +561,20 @@ class OfficeWindow(Adw.ApplicationWindow):
         self.region_row.set_selected(1 if self.preferences.get("region") == "china" else 0)
         connection.add(self.region_row)
         self.region_row.connect("notify::selected", lambda *_: self._save_preferences())
-        self.direct_switch = Adw.SwitchRow(title="Wi-Fi Direct",
-            subtitle=_('Connect directly to your phone using Wi-Fi Direct. Requires a compatible system service.'),
-            active=bool(self.preferences.get("wifi_direct", False)))
-        connection.add(self.direct_switch)
-        self.direct_switch.connect("notify::active", lambda *_: self._save_preferences())
+        self.account_row = Adw.ActionRow(title=_("vivo account"),
+            subtitle=_("Sign in to the same account as your phone for Bluetooth reconnection."))
+        self.account_button = Gtk.Button(label=_("Sign in"), valign=Gtk.Align.CENTER)
+        self.account_button.connect("clicked", lambda *_: self._account_action())
+        self.account_row.add_suffix(self.account_button)
+        connection.add(self.account_row)
+        self._refresh_account()
+        self.direct_row = Adw.ActionRow(title=_('Wi-Fi Direct persistent setup'),
+            subtitle=_('Install the system service to enable direct connections.'))
+        self.direct_install_button = Gtk.Button(valign=Gtk.Align.CENTER)
+        self.direct_install_button.connect('clicked', lambda *_: self._direct_setup_action())
+        self.direct_row.add_suffix(self.direct_install_button)
+        connection.add(self.direct_row)
+        self._refresh_direct_setup()
         advanced = Adw.ExpanderRow(title=_('Advanced connection'), subtitle=_('Optional phone address override'))
         self.phone_entry = Adw.EntryRow(title=_('Phone IP override (optional)'), text=self.preferences.get("manual_phone", ""))
         advanced.add_row(self.phone_entry)
@@ -565,6 +584,11 @@ class OfficeWindow(Adw.ApplicationWindow):
             subtitle=_('Forward phone notifications to this desktop. Applies after reconnecting.'), active=bool(self.preferences.get("notifications", True)))
         connection.add(self.clipboard_switch)
         connection.add(self.notification_switch)
+        self.reconnect_switch = Adw.SwitchRow(title=_("Automatic reconnection"),
+            subtitle=_("Remember the paired phone and retry interrupted connections. Manual disconnect stops automatic reconnection."),
+            active=bool(self.preferences.get("auto_reconnect", True)))
+        self.reconnect_switch.connect("notify::active", self._reconnect_changed)
+        connection.add(self.reconnect_switch)
         self.phone_entry.connect("notify::text", lambda *_: self._save_preferences())
         self.clipboard_switch.connect("notify::active", lambda *_: self._save_preferences())
         self.notification_switch.connect("notify::active", lambda *_: self._save_preferences())
@@ -576,6 +600,13 @@ class OfficeWindow(Adw.ApplicationWindow):
         self.receive_entry.connect("notify::text", lambda *_: self._save_preferences())
         receive.add(self.receive_entry)
         page.add(receive)
+        startup = Adw.PreferencesGroup(title=_('Startup'))
+        self.autostart = Autostart()
+        self.autostart_switch = Adw.SwitchRow(title=_('Start VOkit automatically'),
+            subtitle=_('Start VOkit in the background when you sign in.'), active=self.autostart.enabled())
+        self.autostart_switch.connect('notify::active', self._autostart_changed)
+        startup.add(self.autostart_switch)
+        page.add(startup)
         appearance = Adw.PreferencesGroup(title=_('Appearance'))
         self.language_row = Adw.ComboRow(title=_("Language"),
             subtitle=_("Restart VOkit to apply language changes"),
@@ -593,7 +624,7 @@ class OfficeWindow(Adw.ApplicationWindow):
         pair_row = Adw.ActionRow(title=_('Pair with your phone'), subtitle=_('Create a QR for the selected region, then scan it using your phone.'))
         pair_button = Gtk.Button(label=_('Create pairing QR'), valign=Gtk.Align.CENTER)
         pair_button.add_css_class('suggested-action')
-        pair_button.connect("clicked", lambda *_: self._start_pair())
+        pair_button.connect("clicked", lambda *_: self._choose_connection_method())
         pair_row.add_suffix(pair_button)
         pair_group.add(pair_row)
         page.add(pair_group)
@@ -608,8 +639,10 @@ class OfficeWindow(Adw.ApplicationWindow):
             if self.connected:
                 self._navigate("files")
             else:
-                self._start_pair()
+                self._choose_connection_method()
             return
+        if destination == 'settings':
+            self._refresh_direct_setup()
         self.pages.set_visible_child_name(destination)
         if destination in self.nav_buttons:
             self.nav_buttons[destination].set_active(True)
@@ -1028,6 +1061,13 @@ class OfficeWindow(Adw.ApplicationWindow):
             if self.shutting_down:
                 return
             was_connected = self.connected
+            if not self.startup_resume_checked:
+                self.startup_resume_checked = True
+                if not self.owned and not isinstance(result, dict) and self.reconnect_switch.get_active() and hasattr(self.backend, "remembered"):
+                    saved = self.backend.remembered()
+                    region = "china" if self.region_row.get_selected() == 1 else "overseas"
+                    if saved and saved["region"] == region:
+                        self._start_pair(wifi_direct=saved["wifi_direct"], resume=True)
             if error or not isinstance(result, dict):
                 self.connected = bool(self.owned and self.event_connected)
                 self.external_session = False
@@ -1047,7 +1087,9 @@ class OfficeWindow(Adw.ApplicationWindow):
                         else _('Connected · Reconnect to enable incoming files'))
                 else:
                     self.connection_status.set_text(_('Waiting for your phone…') if self.owned else _('Connect your phone to get started'))
-            if not self.connected and self.pending_sends:
+            if not self.connected and self.reconnecting:
+                self.connection_status.set_text(_("Reconnecting to the remembered phone…"))
+            if not self.connected and self.pending_sends and not self.reconnecting:
                 self.connection_status.set_text(_('Connect your phone to send {value0} queued files').format(value0=len(self.pending_sends)))
             if was_connected and not self.connected:
                 self.generation += 1
@@ -1096,9 +1138,154 @@ class OfficeWindow(Adw.ApplicationWindow):
             self.backend.disconnect()
             self.connection_status.set_text(_('Disconnecting…'))
         else:
-            self._start_pair()
+            saved = self.backend.remembered() if hasattr(self.backend, "remembered") else None
+            region = "china" if self.region_row.get_selected() == 1 else "overseas"
+            if saved and saved["region"] == region and self.reconnect_switch.get_active():
+                self._start_pair(wifi_direct=saved["wifi_direct"], resume=True)
+            else:
+                self._choose_connection_method()
 
-    def _start_pair(self):
+    def _account_args(self, command):
+        state = Path(os.environ.get("XDG_DATA_HOME", str(Path.home()/".local/share"))) / "vivo-office-kit/pairing"
+        return [command, "--state-dir", str(state)]
+
+    def _refresh_account(self):
+        def completed(value, error):
+            if self.shutting_down or self.login_handle:
+                return
+            self.account_logged_in = bool(not error and value and value.get("logged_in"))
+            self.account_button.set_label(_("Sign out") if self.account_logged_in else _("Sign in"))
+            self.account_row.set_subtitle(_("Signed in. Use the same vivo account on your phone.") if self.account_logged_in
+                else _("Sign in to the same account as your phone for Bluetooth reconnection."))
+        self.backend.call(self._account_args("account-status"), completed)
+
+    def _account_action(self):
+        if self.login_handle:
+            self.login_handle.terminate()
+            return
+        logout = self.account_logged_in
+        if logout and hasattr(self.backend, "set_auto_reconnect"):
+            self.backend.set_auto_reconnect(False)
+            if self.reconnecting:
+                self.backend.disconnect()
+        self.account_button.set_label(_("Cancel sign-in") if not logout else _("Sign out"))
+        self.account_row.set_subtitle(_("Complete sign-in in the browser. It uses a separate temporary profile."))
+        def completed(value, error):
+            self.login_handle = None
+            if self.shutting_down: return
+            self._refresh_account()
+            if error:
+                self.receipt.set_text(_("Sign-in failed or was cancelled. Install Chromium or Chrome and try again."))
+            elif not logout and value and value.get("logged_in") and not self.owned and self.reconnect_switch.get_active():
+                saved = self.backend.remembered() if hasattr(self.backend, "remembered") else None
+                region = "china" if self.region_row.get_selected() == 1 else "overseas"
+                if saved and saved["region"] == region:
+                    self._start_pair(wifi_direct=saved["wifi_direct"], resume=True)
+        self.login_handle = self.backend.call(self._account_args("account-logout" if logout else "account-login"), completed)
+
+    def _choose_connection_method(self):
+        dialog = Adw.Dialog(title=_('Choose connection method'), content_width=360)
+        content = box(True, 12)
+        for method in (content.set_margin_top, content.set_margin_bottom, content.set_margin_start, content.set_margin_end):
+            method(24)
+        for title, direct in ((_('Local network'), False), ('Wi-Fi Direct', True)):
+            button = Gtk.Button(label=title)
+            def selected(_button, wifi_direct=direct):
+                dialog.close()
+                self._start_pair(wifi_direct=wifi_direct)
+            button.connect('clicked', selected)
+            content.append(button)
+        dialog.set_child(content)
+        dialog.present(self)
+
+    def _refresh_direct_setup(self, message=None):
+        installed = Path('/etc/vivo-connect-p2p/service.json').exists()
+        self.direct_install_button.set_label(_('Uninstall') if installed else _('Install'))
+        self.direct_row.set_subtitle(message or (_('The persistent Wi-Fi Direct service is installed.') if installed
+            else _('Install the system service to enable direct connections.')))
+
+    def _direct_setup_action(self):
+        # Only run a system-managed installer and its dependencies as root.
+        source = Path(__file__).resolve().parent.parent / 'wifi-direct'
+        files = ('tools/install_p2p_service.py', 'tools/p2p_service.py', 'tools/p2p_persistent.py',
+                 'tools/p2p_helper.py', 'tools/p2p_private.py', 'tools/wifi_capabilities.py',
+                 'tools/p2p_supplicant.config', 'tools/build_p2p_supplicant.py',
+                 'patches/wpa_supplicant-2.12-private-go.patch', 'packaging/systemd/vivo-connect-p2p.service',
+                 'build/private-p2p/bin/wpa_supplicant', 'build/private-p2p/bin/build.json',
+                 'build/private-p2p/bin/COPYING')
+        def trusted(path):
+            for item in (path, *path.parents):
+                try:
+                    info = item.lstat()
+                    if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                        return False
+                except OSError:
+                    return False
+            return True
+        if not shutil.which('pkexec') or not all(trusted(source / name) for name in files):
+            self.direct_row.set_subtitle(_('A trusted system installer and administrator authorization are required.'))
+            return
+        if Path('/etc/vivo-connect-p2p/service.json').exists():
+            dialog = Adw.AlertDialog(heading=_('Uninstall Wi-Fi Direct setup?'),
+                body=_('This stops the shared Wi-Fi Direct service and may disconnect other applications. Saved pairing data will be kept.'))
+            dialog.add_response('cancel', _('Cancel'))
+            dialog.add_response('uninstall', _('Uninstall'))
+            dialog.set_response_appearance('uninstall', Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_default_response('cancel')
+            dialog.set_close_response('cancel')
+            dialog.connect('response', lambda _dialog, response: self._run_direct_installer(source, None) if response == 'uninstall' else None)
+            dialog.present(self)
+            return
+        interfaces = sorted(p.name for p in Path('/sys/class/net').iterdir()
+                            if not p.name.startswith('p2p-') and (p / 'wireless').exists())
+        if not interfaces:
+            self.direct_row.set_subtitle(_('No wireless adapter was found.'))
+            return
+        dialog = Adw.Dialog(title=_('Select a wireless adapter'), content_width=360)
+        content = box(True, 12)
+        for method in (content.set_margin_top, content.set_margin_bottom, content.set_margin_start, content.set_margin_end):
+            method(24)
+        for interface in interfaces:
+            button = Gtk.Button(label=interface)
+            def selected(_button, name=interface):
+                dialog.close()
+                self._run_direct_installer(source, name)
+            button.connect('clicked', selected)
+            content.append(button)
+        dialog.set_child(content)
+        dialog.present(self)
+
+    def _run_direct_installer(self, source, interface):
+        try:
+            args = ['pkexec', '/usr/bin/python3', '-I', str(source / 'tools/install_p2p_service.py')]
+            if interface is None:
+                args.append('uninstall')
+            else:
+                state = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share'))) / 'vokit' / 'wifi-direct'
+                state.mkdir(parents=True, mode=0o700, exist_ok=True)
+                config = state / 'config.json'
+                if not config.exists():
+                    fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, 'w') as stream:
+                        json.dump({'apiToken': secrets.token_urlsafe(32)}, stream)
+                args.extend(['install', '--user', pwd.getpwuid(os.getuid()).pw_name, '--interface', interface,
+                    '--state-dir', str(state), '--port', '8765'])
+            process = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDERR_PIPE)
+            self.direct_install_button.set_sensitive(False)
+            self.direct_row.set_subtitle(_('Waiting for administrator authorization…'))
+            def finished(proc, result):
+                try:
+                    _success, _stdout, stderr = proc.communicate_utf8_finish(result)
+                    message = (_('Wi-Fi Direct setup was removed.') if interface is None else _('Wi-Fi Direct setup is complete.')) if proc.get_successful() else (stderr.strip() or _('Wi-Fi Direct setup failed or was cancelled.'))
+                except GLib.Error:
+                    message = _('Wi-Fi Direct setup failed or was cancelled.')
+                self.direct_install_button.set_sensitive(True)
+                self._refresh_direct_setup(message)
+            process.communicate_utf8_async(None, None, finished)
+        except (OSError, GLib.Error, KeyError):
+            self.direct_row.set_subtitle(_('Wi-Fi Direct setup failed or was cancelled.'))
+
+    def _start_pair(self, wifi_direct=False, resume=False):
         if self.owned or self.external_session:
             self.connection_status.set_text(_('Use the existing connection, or disconnect its owner before pairing again.'))
             return
@@ -1118,10 +1305,18 @@ class OfficeWindow(Adw.ApplicationWindow):
         self._save_preferences()
         self.active_receive_directory = receive
         self.event_connected = False
-        self.connection_status.set_text(_('Creating a pairing QR…'))
+        self.reconnecting = resume
+        self.pair_failure = False
+        self.connection_status.set_text(_('Reconnecting to the remembered phone…') if resume else _('Creating a pairing QR…'))
         self.owned = True
         try:
-            pair_options = {"wifi_direct": True} if self.direct_switch.get_active() else {}
+            if not resume:
+                self._show_pair_progress(wifi_direct)
+            pair_options = {"wifi_direct": True} if wifi_direct else {}
+            if resume:
+                pair_options["resume"] = True
+            if not self.reconnect_switch.get_active():
+                pair_options["auto_reconnect"] = False
             if self.region_row.get_selected() == 1:
                 pair_options["region"] = "china"
             self.backend.pair(phone, True, receive,
@@ -1129,22 +1324,81 @@ class OfficeWindow(Adw.ApplicationWindow):
                 self._pair_event, self._pair_exited, **pair_options)
         except (OSError, RuntimeError, ValueError):
             self.owned = False
-            self.connection_status.set_text(_('The connection could not start. Check the installed backend.'))
+            self._show_pair_failure(_('The connection could not start. Check the installed backend.'))
         self._update_controls()
+
+    def _show_pair_progress(self, wifi_direct):
+        dialog = Adw.Dialog(title=_('Preparing connection'), content_width=360)
+        content = box(True, 16)
+        for method in (content.set_margin_top, content.set_margin_bottom, content.set_margin_start, content.set_margin_end):
+            method(24)
+        spinner = Gtk.Spinner(spinning=True, halign=Gtk.Align.CENTER)
+        content.append(spinner)
+        message = (_('Starting Wi-Fi Direct. This can take up to 45 seconds…') if wifi_direct
+                   else _('Creating a pairing QR…'))
+        self.pair_progress_label = label(message, wrap=True)
+        content.append(self.pair_progress_label)
+        button = Gtk.Button(label=_('Cancel'))
+        button.connect('clicked', lambda *_: dialog.close())
+        content.append(button)
+        self.pair_progress_spinner = spinner
+        self.pair_progress_dialog = dialog
+        def closed(_dialog):
+            if self.pair_progress_dialog is dialog:
+                self.pair_progress_dialog = None
+                if self.owned and not self.pair_failure:
+                    self.backend.disconnect()
+        dialog.connect('closed', closed)
+        dialog.set_child(content)
+        dialog.present(self)
+
+    def _show_pair_failure(self, message):
+        self.pair_failure = True
+        self.connection_status.set_text(message)
+        self.receipt.set_text(message)
+        if self.pair_progress_dialog:
+            self.pair_progress_spinner.set_spinning(False)
+            self.pair_progress_label.set_text(message)
+
+    def _close_pair_progress(self):
+        dialog, self.pair_progress_dialog = self.pair_progress_dialog, None
+        if dialog:
+            dialog.close()
 
     def _pair_event(self, event):
         if self.shutting_down or not isinstance(event, dict):
             return
         stage = event.get("stage")
-        if stage == "pairing_failed":
-            self.receipt.set_text(_('Wi-Fi Direct port is busy. Quit vivo Connect and its backend; keep the system service running, then retry.')
+        if stage in ("reconnect_login_required", "reconnect_bluetooth_required"):
+            self.reconnecting = False
+            self.pair_failure = True
+            self._close_pair_progress()
+            self.receipt.set_text(_("Sign in to the same vivo account before automatic Bluetooth reconnection.")
+                if stage == "reconnect_login_required" else _("Pair this phone in system Bluetooth settings, enable Bluetooth, then connect again."))
+        elif stage in ("reconnect_attempt", "reconnect_wait"):
+            self.reconnecting = True
+            self.event_connected = False
+            self._close_pair_progress()
+            message = (_("Reconnecting in {value0} seconds…").format(value0=event.get("count", 5))
+                       if stage == "reconnect_wait" else _("Reconnecting to the remembered phone…"))
+            self.connection_status.set_text(message)
+        elif stage == "reconnect_pairing_required":
+            self.reconnecting = False
+            self.pair_failure = True
+            self._close_pair_progress()
+            self.receipt.set_text(_("Phone authorization changed. Scan a new QR to connect again."))
+        elif stage == "reconnect_unavailable":
+            self.receipt.set_text(_("This phone did not provide a stable identity; reconnect by scanning a new QR."))
+        elif stage == "pairing_failed":
+            self._show_pair_failure(_('Wi-Fi Direct port is busy. Close the other application using the service, then retry.')
                 if event.get("code") == "wifi_direct_backend_busy" else
-                _('Wi-Fi Direct pairing failed. Enable/check vivo-connect-p2p.service for this user, then create a fresh QR.'))
+                _('Wi-Fi Direct could not start. Check the service and wireless adapter, then retry.'))
         elif stage == "qr_ready":
             path = event.get("qr_path", "")
             if not private_regular(path, 2 * 1024 * 1024):
-                self.connection_status.set_text(_('The pairing QR is unavailable. Reconnect and try again.'))
+                self._show_pair_failure(_('The pairing QR is unavailable. Reconnect and try again.'))
                 return
+            self._close_pair_progress()
             if self.qr_dialog:
                 self.qr_dialog.close()
             self.qr_dialog = Adw.Dialog(title=_('Scan to pair'), content_width=360)
@@ -1157,15 +1411,20 @@ class OfficeWindow(Adw.ApplicationWindow):
             picture.set_size_request(280, 280)
             content.append(picture)
             content.append(label(_('Approve this computer on the phone'), "muted small", wrap=True))
+            close_button = Gtk.Button(label=_('Close'))
+            close_button.connect('clicked', lambda *_: self._close_qr_dialog())
+            content.append(close_button)
             self.qr_dialog.set_child(content)
+            dialog = self.qr_dialog
+            dialog.connect('closed', lambda current: setattr(self, 'qr_dialog', None) if self.qr_dialog is current else None)
             self.qr_dialog.present(self)
             self.connection_status.set_text(_('Scan the QR, then approve the connection on your phone'))
         elif stage == "control_connected":
+            self.reconnecting = False
             self.event_connected = True
+            self._close_pair_progress()
             self._navigate("files")
-            if self.qr_dialog:
-                self.qr_dialog.close()
-                self.qr_dialog = None
+            self._close_qr_dialog()
             self._poll_status()
         elif stage == "control_disconnected":
             self.event_connected = False
@@ -1180,13 +1439,21 @@ class OfficeWindow(Adw.ApplicationWindow):
         elif stage in {"file_permission_denied", "file_permission_timeout"}:
             self.receipt.set_text(_('Approve file access in Office Kit on the phone to browse and transfer files.'))
 
-    def _pair_exited(self, *_args):
+    def _pair_exited(self, code=0, *_args):
+        self.reconnecting = False
+        if code and self.pair_progress_dialog and not self.pair_failure:
+            self._show_pair_failure(_('The connection could not start. Check the installed backend.'))
+        elif not self.pair_failure:
+            self._close_pair_progress()
         self.owned = self.event_connected = False
-        if self.qr_dialog:
-            self.qr_dialog.close()
-            self.qr_dialog = None
+        self._close_qr_dialog()
         self._poll_status()
         self._update_controls()
+
+    def _close_qr_dialog(self):
+        dialog, self.qr_dialog = self.qr_dialog, None
+        if dialog:
+            dialog.close()
 
     def _choose_receive_folder(self):
         dialog = Gtk.FileDialog(title=_('Choose receive folder'))
@@ -1209,18 +1476,34 @@ class OfficeWindow(Adw.ApplicationWindow):
             return
         for key, value in (("manual_phone", self.phone_entry.get_text().strip()),
                            ("region", "china" if self.region_row.get_selected() == 1 else "overseas"),
-                           ("wifi_direct", self.direct_switch.get_active()),
                            ("receive_dir", self.receive_entry.get_text().strip()),
                            ("clipboard", self.clipboard_switch.get_active()),
                            ("notifications", self.notification_switch.get_active())):
             self.preferences.set(key, value)
         self.preferences.save()
 
+    def _reconnect_changed(self, current, _param):
+        self.preferences.set("auto_reconnect", current.get_active())
+        self.preferences.save()
+        if hasattr(self.backend, "set_auto_reconnect"):
+            # Disabling affects subsequent retries too; the active session stays up.
+            self.backend.set_auto_reconnect(current.get_active())
+
     def _theme_changed(self, current, _param):
         theme = ("dark", "system", "light")[current.get_selected()]
         self.preferences.set("theme", theme)
         self.preferences.save()
         self._apply_theme(theme)
+
+    def _autostart_changed(self, current, _param):
+        try:
+            self.autostart.set_enabled(current.get_active())
+            current.set_subtitle(_('Start VOkit in the background when you sign in.'))
+        except OSError as error:
+            current.handler_block_by_func(self._autostart_changed)
+            current.set_active(self.autostart.enabled())
+            current.handler_unblock_by_func(self._autostart_changed)
+            current.set_subtitle(_('Could not change startup settings: {value0}').format(value0=str(error)))
 
     def _language_changed(self, current, _param):
         self.preferences.set("language", LANGUAGES[current.get_selected()][0])
@@ -1296,9 +1579,15 @@ class OfficeApplication(Adw.Application):
         self.window = None
         self.test_exit = 0
         self.tray = None
+        self.start_in_background = False
 
     def do_startup(self):
         Adw.Application.do_startup(self)
+        if not self.testing:
+            try:
+                Autostart().migrate_background()
+            except (OSError, UnicodeError):
+                pass
         # Installed icons come from hicolor; source builds carry the same theme.
         local_icons = Path(__file__).resolve().parent.parent / "icons"
         if local_icons.is_dir():
@@ -1329,7 +1618,11 @@ class OfficeApplication(Adw.Application):
         return self.window
 
     def do_activate(self):
-        self._ensure_window().present()
+        window = self._ensure_window()
+        if self.start_in_background:
+            self.start_in_background = False
+        else:
+            window.present()
         self.update_tray()
 
     def update_tray(self):
@@ -1514,9 +1807,18 @@ class _TestBackend:
 def main(argv=None):
     parser = argparse.ArgumentParser(description="VOkit native GTK desktop")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--background", action="store_true", help="start without showing the window")
     parser.add_argument("files", nargs="*", help="Local files to send to the connected phone")
     options = parser.parse_args(argv)
+    if options.background and options.files:
+        parser.error('--background cannot be combined with files')
     app = OfficeApplication(_TestBackend(), _TestSettings(), testing=True) if options.self_test else OfficeApplication()
+    if options.background:
+        app.start_in_background = True
+        if not app.register(None):
+            return 1
+        if app.get_is_remote():
+            return 0
     code = app.run([sys.argv[0]] + [Gio.File.new_for_commandline_arg(path).get_uri() for path in options.files])
     return app.test_exit or code
 

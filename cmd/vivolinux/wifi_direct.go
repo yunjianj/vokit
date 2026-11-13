@@ -137,6 +137,7 @@ type directBroker struct {
 	pairingID     string
 	pairingUntil  time.Time
 	closed        bool
+	automatic     bool
 	// Dependency seam for offline protocol tests.
 	owns   func(string, string) bool
 	listen func(string, string) (net.Listener, error)
@@ -223,7 +224,10 @@ func (b *directBroker) handleAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	case "/api/p2p/heartbeat", "/api/p2p/unregister":
 		var body struct {
-			ID string `json:"id"`
+			ID       string `json:"id"`
+			Progress struct {
+				Stations int `json:"authorizedStations"`
+			} `json:"progress"`
 		}
 		if json.Unmarshal(data, &body) != nil || b.network.ID == "" || body.ID != b.network.ID {
 			directReply(w, 404, status())
@@ -240,6 +244,23 @@ func (b *directBroker) handleAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	directReply(w, 200, status())
+}
+
+func (b *directBroker) authorizeAutomatic(id string) func() {
+	b.mu.Lock()
+	b.automatic = true
+	b.pairingID = id
+	b.pairingUntil = time.Now().Add(60 * time.Second)
+	b.mu.Unlock()
+	return func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.pairingID == id {
+			b.automatic = false
+			b.pairingID = ""
+			b.pairingUntil = time.Time{}
+		}
+	}
 }
 
 func (b *directBroker) waitNetwork(ctx context.Context) (directNetwork, error) {
@@ -281,7 +302,7 @@ func (b *directBroker) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil || parseErr != nil || !ip.Is4() || ip == gw || !netip.PrefixFrom(gw, 24).Masked().Contains(ip) || ip.As4()[3] == 0 || ip.As4()[3] == 255 ||
-		b.closed || b.pairingID == "" || !time.Now().Before(b.pairingUntil) || !time.Now().Before(b.lease) {
+		b.closed || b.automatic || b.pairingID == "" || !time.Now().Before(b.pairingUntil) || !time.Now().Before(b.lease) {
 		directReply(w, 403, map[string]string{"code": "000001"})
 		return
 	}

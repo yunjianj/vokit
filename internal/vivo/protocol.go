@@ -135,15 +135,19 @@ func LoadIdentity(dir string) (Identity, error) {
 }
 
 type Session struct {
-	Region       Region
-	Identity     Identity
-	HostName     string
-	Token        string
-	SID          string
-	ConnectionID string
-	StorageRoot  string `json:"-"`
-	DeviceName   string `json:"-"`
-	ExpiresAt    time.Time
+	Region        Region
+	Identity      Identity
+	HostName      string
+	Token         string
+	SID           string
+	ConnectionID  string
+	StorageRoot   string `json:"-"`
+	DeviceName    string `json:"-"`
+	PhoneDeviceID string `json:"-"`
+	PhoneBleID    string `json:"-"`
+	AutoConnect   bool   `json:"-"`
+	AccountOpenID string `json:"-"`
+	ExpiresAt     time.Time
 }
 
 func NewSession(identity Identity, hostname, localIP string) (*Session, error) {
