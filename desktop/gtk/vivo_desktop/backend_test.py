@@ -91,6 +91,21 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(events[0]["stage"], "control_connected")
         backend.close()
 
+    def test_direct_pair_passes_mode_without_starting_another_helper(self):
+        backend = Backend(self.cli('import sys,json\nprint(json.dumps({"stage":"arguments","args":sys.argv[1:]}),flush=True)\n'))
+        events = []
+        try:
+            value, error = self.wait(lambda done: backend.pair("", True, str(self.root), False, False,
+                events.append, lambda code: done({"exit":code}, None), wifi_direct=True, region="china"))
+            self.assertIsNone(error)
+            self.assertEqual(value["exit"], 0)
+            self.assertIn("--wifi-direct", events[0]["args"])
+            self.assertNotIn("--local-ip", events[0]["args"])
+            args = events[0]["args"]
+            self.assertEqual(args[args.index("--region") + 1], "china")
+        finally:
+            backend.close()
+
 
 class TransferBoundaryTests(unittest.TestCase):
     def test_batch_download_names_preserve_existing_files(self):
@@ -166,7 +181,7 @@ class BatchDispatchTests(unittest.TestCase):
     def test_connect_opens_pairing_without_ip_or_trust_toggle(self):
         from .app import Adw, OfficeWindow, _TestBackend, _TestSettings
         class Backend(_TestBackend):
-            def pair(self, *args): self.pair_arguments = args
+            def pair(self, *args, **kwargs): self.pair_arguments, self.pair_options = args, kwargs
         backend = Backend()
         app = Adw.Application(application_id="org.vokit.QRConnectTest")
         settings = _TestSettings()
@@ -181,6 +196,24 @@ class BatchDispatchTests(unittest.TestCase):
             self.assertEqual(backend.pair_arguments[0], "")
             self.assertTrue(backend.pair_arguments[1])
             self.assertNotIn("trust", settings.values)
+            self.assertFalse(window.direct_switch.get_active())
+            self.assertEqual(backend.pair_options, {})
+            window.owned = False
+            window.direct_switch.set_active(True)
+            window._start_pair()
+            self.assertEqual(backend.pair_options, {"wifi_direct": True})
+            self.assertTrue(settings.get("wifi_direct"))
+            window.owned = False
+            window.region_row.set_selected(1)
+            window._start_pair()
+            self.assertEqual(backend.pair_options, {"wifi_direct": True, "region": "china"})
+            self.assertEqual(settings.get("region"), "china")
+            window.owned = False
+            window.direct_switch.set_active(False)
+            window._start_pair()
+            self.assertEqual(backend.pair_options, {"region": "china"})
+            window._pair_event({"stage":"pairing_failed", "code":"wifi_direct_backend_busy"})
+            self.assertIn("port is busy", window.receipt.get_text())
         finally:
             window.shutdown()
             window.destroy()

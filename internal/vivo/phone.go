@@ -159,7 +159,7 @@ func (p *PhoneClient) post(ctx context.Context, path string, s *Session, body an
 }
 
 func (p *PhoneClient) Negotiate(ctx context.Context, s *Session) (map[string]bool, error) {
-	version := map[string]any{"version": "7.0.6", "connBaseVersionCode": 1155, "pcSuiteVersionCode": 70007, "timestamp": time.Now().UnixMilli(), "connectionId": s.ConnectionID, "pcDeviceId": s.Identity.DeviceID, "isAutoConnect": false, "token": s.Token, "isOversea": true, "pcOsType": "linux", "pcOsVersion": runtime.GOOS + "/" + runtime.GOARCH}
+	version := map[string]any{"version": "7.0.6", "connBaseVersionCode": 1155, "pcSuiteVersionCode": 70007, "timestamp": time.Now().UnixMilli(), "connectionId": s.ConnectionID, "pcDeviceId": s.Identity.DeviceID, "isAutoConnect": false, "token": s.Token, "isOversea": s.Region.Overseas(), "pcOsType": "linux", "pcOsVersion": runtime.GOOS + "/" + runtime.GOARCH}
 	var reply struct {
 		Code string `json:"code"`
 		Data struct {
@@ -177,7 +177,11 @@ func (p *PhoneClient) Negotiate(ctx context.Context, s *Session) (map[string]boo
 	if reply.Data.Suite < 70007 || reply.Data.Connbase < 1155 || reply.Data.ENP > 1 {
 		return nil, errors.New("phone component versions are incompatible with this protocol milestone")
 	}
-	base := map[string]any{"pc_name": s.HostName, "pcDeviceId": s.Identity.DeviceID, "isLogin": false, "openid": "", "pcLoginAccount": "", "isAutoConnect": false, "pcSystemType": "1", "isSupVdfs": false, "token": s.Token, "isPcOsSupportExtScreen": false, "pcBleId": s.Identity.DeviceID, "deviceAvatarUri": ""}
+	bleID := s.Identity.DeviceID
+	if !s.Region.Overseas() {
+		bleID = ""
+	}
+	base := map[string]any{"pc_name": s.HostName, "pcDeviceId": s.Identity.DeviceID, "isLogin": false, "openid": "", "pcLoginAccount": "", "isAutoConnect": false, "pcSystemType": "1", "isSupVdfs": false, "token": s.Token, "isPcOsSupportExtScreen": false, "pcBleId": bleID, "deviceAvatarUri": ""}
 	var info struct {
 		Code string                     `json:"code"`
 		Data map[string]json.RawMessage `json:"data"`

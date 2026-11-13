@@ -43,7 +43,9 @@ Flags must precede positional arguments. Doctor and device lists emit JSON.
 The daemon stays in the foreground. The GTK desktop owns its paired background session.
 ADB fallback commands require separately installed adb/scrcpy and authorized USB debugging.
 Pair discovers the phone from a fresh QR scan; --phone is an optional address filter.
-The QR bootstrap currently uses the India-region vivo rendezvous service.
+Pair --region china selects mainland vivo mutual transfer; --region overseas
+(default) selects India Office Kit. pair --wifi-direct
+reuses the installed vivo-connect-p2p.service; quit vivo Connect's backend first.
 Install qrencode; clipboard/notifications use make desktop's GTK helper. File commands
 use the active native session and phone permission. The GTK frontend uses GStreamer for preview.
 Push/pull explicitly write files and may overwrite existing files.

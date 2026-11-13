@@ -538,7 +538,18 @@ class OfficeWindow(Adw.ApplicationWindow):
         container.append(heading)
         page = Adw.PreferencesPage()
         page.add_css_class("settings-content")
-        connection = Adw.PreferencesGroup(title="Connect your phone", description="Scan the pairing QR in Office Kit and approve the connection on your phone. No IP address or vivo account is needed.")
+        connection = Adw.PreferencesGroup(title="Connect your phone", description="Choose your phone's edition, scan the QR in Office Kit or vivo 互传, and approve the connection. No IP address or vivo account is needed.")
+        self.region_row = Adw.ComboRow(title="Pairing region / 配对地区",
+            subtitle="Applies to the next QR and connection",
+            model=Gtk.StringList.new(["Overseas / India (Office Kit)", "中国大陆（vivo 互传）"]))
+        self.region_row.set_selected(1 if self.preferences.get("region") == "china" else 0)
+        connection.add(self.region_row)
+        self.region_row.connect("notify::selected", lambda *_: self._save_preferences())
+        self.direct_switch = Adw.SwitchRow(title="Wi-Fi Direct",
+            subtitle="Reuse the persistent vivo Connect service. Quit vivo Connect and its backend first; keep the system service running.",
+            active=bool(self.preferences.get("wifi_direct", False)))
+        connection.add(self.direct_switch)
+        self.direct_switch.connect("notify::active", lambda *_: self._save_preferences())
         advanced = Adw.ExpanderRow(title="Advanced connection", subtitle="Optional phone address override")
         self.phone_entry = Adw.EntryRow(title="Phone IP override (optional)", text=self.preferences.get("manual_phone", ""))
         advanced.add_row(self.phone_entry)
@@ -566,7 +577,7 @@ class OfficeWindow(Adw.ApplicationWindow):
         appearance.add(self.theme_row)
         page.add(appearance)
         pair_group = Adw.PreferencesGroup()
-        pair_row = Adw.ActionRow(title="Pair with Office Kit", subtitle="Create a QR, then scan it using your phone.")
+        pair_row = Adw.ActionRow(title="Pair with your phone", subtitle="Create a QR for the selected region, then scan it using your phone.")
         pair_button = Gtk.Button(label="Create pairing QR", valign=Gtk.Align.CENTER)
         pair_button.add_css_class("suggested-action")
         pair_button.connect("clicked", lambda *_: self._start_pair())
@@ -1097,9 +1108,12 @@ class OfficeWindow(Adw.ApplicationWindow):
         self.connection_status.set_text("Creating a pairing QR…")
         self.owned = True
         try:
+            pair_options = {"wifi_direct": True} if self.direct_switch.get_active() else {}
+            if self.region_row.get_selected() == 1:
+                pair_options["region"] = "china"
             self.backend.pair(phone, True, receive,
                 self.clipboard_switch.get_active(), self.notification_switch.get_active(),
-                self._pair_event, self._pair_exited)
+                self._pair_event, self._pair_exited, **pair_options)
         except (OSError, RuntimeError, ValueError):
             self.owned = False
             self.connection_status.set_text("The connection could not start. Check the installed backend.")
@@ -1109,18 +1123,22 @@ class OfficeWindow(Adw.ApplicationWindow):
         if self.shutting_down or not isinstance(event, dict):
             return
         stage = event.get("stage")
-        if stage == "qr_ready":
+        if stage == "pairing_failed":
+            self.receipt.set_text("Wi-Fi Direct port is busy. Quit vivo Connect and its backend; keep the system service running, then retry."
+                if event.get("code") == "wifi_direct_backend_busy" else
+                "Wi-Fi Direct pairing failed. Enable/check vivo-connect-p2p.service for this user, then create a fresh QR.")
+        elif stage == "qr_ready":
             path = event.get("qr_path", "")
             if not private_regular(path, 2 * 1024 * 1024):
                 self.connection_status.set_text("The pairing QR is unavailable. Reconnect and try again.")
                 return
             if self.qr_dialog:
                 self.qr_dialog.close()
-            self.qr_dialog = Adw.Dialog(title="Scan with Office Kit", content_width=360)
+            self.qr_dialog = Adw.Dialog(title="Scan to pair / 扫码配对", content_width=360)
             content = box(True, 16)
             for method in (content.set_margin_top, content.set_margin_bottom, content.set_margin_start, content.set_margin_end):
                 method(24)
-            content.append(label("Scan this QR with Office Kit on your phone", wrap=True))
+            content.append(label("Scan with Office Kit or vivo 互传 for the selected region", wrap=True))
             picture = Gtk.Picture.new_for_filename(path)
             picture.set_content_fit(Gtk.ContentFit.CONTAIN)
             picture.set_size_request(280, 280)
@@ -1177,6 +1195,8 @@ class OfficeWindow(Adw.ApplicationWindow):
         if not hasattr(self, "receive_entry"):
             return
         for key, value in (("manual_phone", self.phone_entry.get_text().strip()),
+                           ("region", "china" if self.region_row.get_selected() == 1 else "overseas"),
+                           ("wifi_direct", self.direct_switch.get_active()),
                            ("receive_dir", self.receive_entry.get_text().strip()),
                            ("clipboard", self.clipboard_switch.get_active()),
                            ("notifications", self.notification_switch.get_active())):

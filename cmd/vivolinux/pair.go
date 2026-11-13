@@ -38,6 +38,8 @@ type pairOptions struct {
 	nativeSocket              string
 	fileAccess, mirror        bool
 	persistent                bool
+	wifiDirect                bool
+	region                    vivo.Region
 }
 
 func privateAddress(value string) (netip.Addr, error) {
@@ -55,6 +57,7 @@ func privateAddress(value string) (netip.Addr, error) {
 func parsePairOptions(args []string) (pairOptions, error) {
 	var options pairOptions
 	var phone string
+	var region string
 	flags := flag.NewFlagSet("pair", flag.ContinueOnError)
 	flags.StringVar(&options.receiveDir, "receive-dir", "", "automatically receive phone Share files into this directory")
 	flags.StringVar(&options.stateDir, "state-dir", "build/pairing", "private pairing state directory")
@@ -74,11 +77,21 @@ func parsePairOptions(args []string) (pairOptions, error) {
 	flags.BoolVar(&options.fileAccess, "file-access", false, "request phone file access for commands on the active session")
 	flags.BoolVar(&options.mirror, "mirror-native", false, "experimental native video-only H.264 preview using ffplay")
 	flags.BoolVar(&options.persistent, "persistent", false, "keep the authorized session running until stopped or disconnected")
+	flags.BoolVar(&options.wifiDirect, "wifi-direct", false, "reuse the installed vivo-connect-p2p persistent system service (quit its other backend first)")
+	flags.StringVar(&region, "region", "overseas", "phone edition: overseas (India Office Kit) or china (mainland vivo mutual transfer)")
 	if err := flags.Parse(args); err != nil {
 		return options, err
 	}
 	if flags.NArg() != 0 {
 		return options, errors.New("pair takes flags only")
+	}
+	var regionErr error
+	options.region, regionErr = vivo.ParseRegion(region)
+	if regionErr != nil {
+		return options, regionErr
+	}
+	if options.wifiDirect && options.localIP != "" {
+		return options, errors.New("--wifi-direct selects its local address from the persistent service; omit --local-ip")
 	}
 	if options.duration <= 0 || options.duration > 24*time.Hour {
 		return options, errors.New("duration must be greater than zero and at most 24h")
@@ -169,7 +182,7 @@ func writeQR(ctx context.Context, uri, path string) error {
 	return nil
 }
 
-func runPair(ctx context.Context, args []string) error {
+func runPair(ctx context.Context, args []string) (resultErr error) {
 	options, err := parsePairOptions(args)
 	if errors.Is(err, flag.ErrHelp) {
 		return nil
@@ -177,6 +190,16 @@ func runPair(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	callerContext := ctx
+	defer func() {
+		if options.wifiDirect && resultErr != nil && callerContext.Err() == nil {
+			code := "wifi_direct_failed"
+			if errors.Is(resultErr, errDirectPortBusy) {
+				code = "wifi_direct_backend_busy"
+			}
+			json.NewEncoder(os.Stdout).Encode(vivo.Event{Time: time.Now().UTC(), Stage: "pairing_failed", Code: code})
+		}
+	}()
 	if _, err := exec.LookPath("qrencode"); err != nil {
 		return errors.New("install qrencode before starting native QR pairing")
 	}
@@ -200,7 +223,19 @@ func runPair(ctx context.Context, args []string) error {
 		}
 		defer bridge.Close()
 	}
-	if options.localIP == "" {
+	var direct *directBroker
+	if options.wifiDirect {
+		direct, err = startDirectBroker()
+		if err != nil {
+			return err
+		}
+		defer direct.Close()
+		network, err := direct.waitNetwork(ctx)
+		if err != nil {
+			return err
+		}
+		options.localIP = network.IP
+	} else if options.localIP == "" {
 		options.localIP, err = localLANIP()
 		if err != nil {
 			return err
@@ -218,10 +253,7 @@ func runPair(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	cloud, err := vivo.NewRendezvous(vivo.IndiaGateway, id, nil)
-	if err != nil {
-		return err
-	}
+	session.Region = options.region
 	dir, err := os.MkdirTemp(options.stateDir, "scan-")
 	if err != nil {
 		return errors.New("cannot create private test-session directory")
@@ -249,10 +281,19 @@ func runPair(ctx context.Context, args []string) error {
 	}
 	stage := func(name string) { emit(vivo.Event{Time: time.Now().UTC(), Stage: name}) }
 	fmt.Fprintln(os.Stderr, "Native QR pairing test. Event log:", filepath.Join(dir, "events.jsonl"))
-	if err := cloud.Begin(ctx, session); err != nil {
-		return err
+	var cloud *vivo.Rendezvous
+	var uri string
+	if direct != nil {
+		uri, err = direct.begin(session)
+	} else {
+		cloud, err = vivo.NewRendezvous(options.region.Gateway(), id, nil)
+		if err == nil {
+			err = cloud.Begin(ctx, session)
+		}
+		if err == nil {
+			uri, err = session.QR(options.region.Gateway())
+		}
 	}
-	uri, err := session.QR(vivo.IndiaGateway)
 	if err != nil {
 		return err
 	}
@@ -264,7 +305,12 @@ func runPair(ctx context.Context, args []string) error {
 	fmt.Fprintln(os.Stderr, "Scan this image using the phone's Office Kit scanner:", qrPath)
 	fmt.Fprintln(os.Stderr, "QR expires:", session.ExpiresAt.Format(time.RFC3339))
 	emit(vivo.Event{Time: time.Now().UTC(), Stage: "qr_ready", QRPath: qrPath})
-	peer, err := cloud.Wait(ctx, session)
+	var peer vivo.Peer
+	if direct != nil {
+		peer, err = direct.waitPeer(ctx)
+	} else {
+		peer, err = cloud.Wait(ctx, session)
+	}
 	if err != nil {
 		return err
 	}
